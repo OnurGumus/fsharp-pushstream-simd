@@ -19,6 +19,9 @@ A small exploration extending the original push-stream work, ported to **.NET 10
   fused F# push stream against hand-written code, System.Linq and ValueLinq (delegate + struct-func).
   Finding: on .NET 10 the fused push stream (`|>>`) ties hand-written code and ValueLinq's struct
   path; ValueLinq's old "beats handcoded by 37%" edge no longer reproduces — the JIT caught up.
+  Also includes a head-to-head vs **Nessos.Streams** (the established F# stream library): the fused
+  push stream beats it at every size (≈4.7× at N=100, ≈1.3× at N=1M) and allocates nothing where
+  Nessos allocates 448 B per run — Nessos predates `InlineIfLambda` and so cannot fuse.
 - **`PushStream6.SimdBenchmark`** — a **SIMD-fused push stream**. Because the push model *owns the
   loop*, the source can push `Vector<int>` blocks (with a scalar tail) instead of one element at a
   time, and `InlineIfLambda` fuses the per-block lambda away. A composable
@@ -34,6 +37,12 @@ A small exploration extending the original push-stream work, ported to **.NET 10
   i.e. a composable, zero-allocation stream that runs **~3× faster than scalar** and matches a
   hand-tuned SIMD loop. This is the one path that genuinely (and reproducibly) beats the scalar
   baseline, rather than tying it.
+
+  The stream core is **generic over `Vector<'T>`** with explicit-combiner `reduce`, `sum`/`min`/`max`
+  sinks and a `dot` routine (dot needs two synchronized sources — the "needs a PumpStream" case — so
+  it's a direct vector routine, not a single-source pipe). Benchmarked at both `int` (8 lanes) and
+  `float`/`double` (4 lanes); the float pipeline shows the same ≈3.8× win at L1-resident sizes,
+  confirming the technique generalizes across element types.
 
 ---
 

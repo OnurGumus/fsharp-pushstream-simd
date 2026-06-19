@@ -42,6 +42,16 @@ module PS =
     |>> filter (fun x -> (x &&& 1) = 0)
     |>> fold   (fun a v -> if v > a then v else a) Int32.MinValue
 
+// Nessos.Streams (the established F# push/pull stream lib, pre-InlineIfLambda)
+module Nessos =
+  open Nessos.Streams
+  let run (ints : int[]) =
+    ints
+    |> Stream.ofArray
+    |> Stream.map    (fun x -> x / 2)
+    |> Stream.filter (fun x -> (x &&& 1) = 0)
+    |> Stream.fold   (fun a v -> if v > a then v else a) Int32.MinValue
+
 [<MemoryDiagnoser>]
 type MaxBench() =
 
@@ -79,6 +89,9 @@ type MaxBench() =
 
   [<Benchmark>]
   member this.PushStreamFused() = PS.runFused this.Ints
+
+  [<Benchmark>]
+  member this.NessosStreams() = Nessos.run this.Ints
 
 module Main =
   [<EntryPoint>]
