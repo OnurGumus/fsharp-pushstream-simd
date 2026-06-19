@@ -1,3 +1,42 @@
+# fsharp-pushstream-simd
+
+> **Attribution.** This is a derivative of [**mrange/PushStream6**](https://github.com/mrange/PushStream6)
+> by **Mårten Rånge** (© 2021, MIT), with contributions from **Paul Westcott** (`manofstick`,
+> author of [Cistern.ValueLinq](https://github.com/manofstick/Cistern.ValueLinq)). All of the
+> original design and the F# Advent 2021 write-up below are Mårten's work — the full original git
+> history is preserved in this repo. Please read his article first; it explains the core technique.
+>
+> The original library and benchmarks are unchanged in spirit; the LICENSE (MIT) is preserved.
+
+## What this fork adds (Onur Gumus, 2026)
+
+A small exploration extending the original push-stream work, ported to **.NET 10**:
+
+- **`.NET 10` port** of every project + BenchmarkDotNet `0.13.x → 0.15.8` (the old version
+  couldn't generate its boilerplate on the .NET 10 SDK).
+- **`PushStream6.MaxBenchmark`** — reproduces Cistern.ValueLinq's classic
+  `Select(x/2).Where(even).Max()` benchmark over `int[]` at N = 1 / 100 / 1M, comparing the
+  fused F# push stream against hand-written code, System.Linq and ValueLinq (delegate + struct-func).
+  Finding: on .NET 10 the fused push stream (`|>>`) ties hand-written code and ValueLinq's struct
+  path; ValueLinq's old "beats handcoded by 37%" edge no longer reproduces — the JIT caught up.
+- **`PushStream6.SimdBenchmark`** — a **SIMD-fused push stream**. Because the push model *owns the
+  loop*, the source can push `Vector<int>` blocks (with a scalar tail) instead of one element at a
+  time, and `InlineIfLambda` fuses the per-block lambda away. A composable
+  `ofArray |>> map |>> sum` pipeline compiles down to a hand-written SIMD loop:
+
+  | sum-of-squares, .NET 10, AVX2 | N=1000 | N=1,000,000 |
+  |---|---:|---:|
+  | hand-written scalar loop (baseline) | 1.00× | 1.00× |
+  | fused scalar push stream (`\|>>`) | 1.00× | 1.06× |
+  | hand-written SIMD loop | 0.33× | 0.58× |
+  | **SIMD push stream (this fork)** | **0.33×** | **0.44×** |
+
+  i.e. a composable, zero-allocation stream that runs **~3× faster than scalar** and matches a
+  hand-tuned SIMD loop. This is the one path that genuinely (and reproducibly) beats the scalar
+  baseline, rather than tying it.
+
+---
+
 # F# Advent 2021  Dec 08 - Fast data pipelines with F#6
 
 _Thanks to [Sergey Tihon](https://www.linkedin.com/in/sergeytihon/) for running [F# Weekly](https://sergeytihon.com/2021/10/18/f-advent-calendar-2021/) and [F# Advent](https://sergeytihon.com/2021/10/18/f-advent-calendar-2021/)._

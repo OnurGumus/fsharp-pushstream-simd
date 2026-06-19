@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2021 mrange
+Copyright (c) 2021 mrange (Mårten Rånge) — original PushStream6
+Copyright (c) 2026 Onur Gumus — .NET 10 port and SIMD/Max benchmark additions
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
