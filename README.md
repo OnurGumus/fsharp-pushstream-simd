@@ -52,17 +52,26 @@ A small exploration extending the original push-stream work, ported to **.NET 10
   | float sum of a compute kernel | N=1,000,000 | N=8,000,000 |
   |---|---:|---:|
   | sequential scalar (baseline) | 1.00× | 1.00× |
-  | sequential SIMD (fused stream) | 0.28× | 0.26× |
-  | parallel scalar | 0.17× | 0.15× |
-  | **parallel SIMD (`parReduce`)** | **0.05×** | **0.05×** |
+  | sequential SIMD (fused stream) | 0.26× | 0.24× |
+  | sequential SIMD + **explicit FMA** | 0.11× | 0.11× |
+  | parallel scalar | 0.15× | 0.13× |
+  | parallel SIMD (`parReduce`) | 0.05× | 0.04× |
+  | **parallel SIMD + explicit FMA** | **0.02×** | **0.02×** |
 
-  i.e. ≈3.6–3.9× from lanes × ≈6× from cores ≈ **~20× combined** (slightly sub-multiplicative from
-  shared memory bandwidth + the sequential combine), at a constant ~3.5 KB of task overhead. This is
+  i.e. ≈3.8× from lanes × ≈6× from cores × ≈2.2× from FMA ≈ **~45–56× combined** over scalar. This is
   **monoid-only**: `parReduce` requires an associative combine, so it covers reductions
   (`sum`/`min`/`max`/`count`/`dot`) but deliberately *not* early-exit or order-dependent ops
   (`scan`/`pairwise`) — the honest boundary of the push model under partitioning. The win only
   materializes when per-element work is non-trivial; on a bandwidth-bound reduction (e.g. summing raw
   `int`s) adding cores buys little, so the benchmark uses a compute-heavy kernel.
+
+  **Explicit FMA is a free ~2.2× left on the table by the JIT.** RyuJIT will not auto-contract
+  `t*a + b` into a fused multiply-add (IEEE: FMA rounds once, mul-then-add twice), so it emits a
+  separate `vmulpd` + `vaddpd` — verified in the disassembly. `Vector.FusedMultiplyAdd` forces the
+  single `vfmadd213pd` the hardware has had since Haswell (2013). Because this kernel is a *serial
+  dependency chain* (`t` depends on the previous `t`) it is **latency-bound, not throughput-bound**, so
+  collapsing an ~8-cycle dependent `vmul→vadd` into one ~4–5-cycle `vfmadd` halves the critical path —
+  hence slightly *over* 2×. FMA stacks cleanly on top of both other axes (`ParSimdFma`).
 
 - **`MatMulBench`** — the same two axes on a *real* algorithm, matrix multiply `C = A·B`
   (`float`, row-major). The `ikj` loop order makes the inner loop a broadcast-FMA over

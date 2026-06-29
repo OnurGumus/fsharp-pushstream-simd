@@ -174,6 +174,21 @@ module Kernel =
     for _ in 1 .. STEPS do t <- t * a + b
     t
 
+  // Same math, but EXPLICIT fused multiply-add. RyuJIT won't auto-contract
+  // `t*a + b` into one FMA (IEEE: FMA rounds once, mul-then-add twice), so the
+  // plain version above emits vmulpd + vaddpd. These force the single vfmadd /
+  // scalar FMA the hardware (FMA3, present since Haswell) already supports.
+  let inline scalarFma (x : float) =
+    let mutable t = x
+    for _ in 1 .. STEPS do t <- System.Math.FusedMultiplyAdd(t, 0.999, 0.001)
+    t
+  let inline vectorFma (x : Vector<float>) =
+    let a = Vector<float>(0.999)
+    let b = Vector<float>(0.001)
+    let mutable t = x
+    for _ in 1 .. STEPS do t <- Vector.FusedMultiplyAdd(t, a, b)
+    t
+
 // The 2x2: {sequential, parallel} x {scalar, SIMD}, all summing Kernel over a float[].
 module Compute =
   open SimdStream
@@ -187,6 +202,15 @@ module Compute =
     parReduce xs
       Vector<float>.Zero Kernel.vector (fun a b -> a + b)
       0.0                Kernel.scalar (+)
+      (fun v -> Vector.Sum v)
+
+  // ...and the same two, but with the kernel using explicit fused multiply-add.
+  let seqSimdFmaSum (xs : float[]) =
+    ofArray xs |>> map Kernel.vectorFma Kernel.scalarFma |>> sumF
+  let parSimdFmaSum (xs : float[]) =
+    parReduce xs
+      Vector<float>.Zero Kernel.vectorFma (fun a b -> a + b)
+      0.0                Kernel.scalarFma (+)
       (fun v -> Vector.Sum v)
 
   // parallel + scalar: threads but no vectorization (isolates the cores axis).
@@ -280,10 +304,16 @@ type ParBench() =
   member this.SeqSimd() = Compute.seqSimdSum this.Fs
 
   [<Benchmark>]
+  member this.SeqSimdFma() = Compute.seqSimdFmaSum this.Fs
+
+  [<Benchmark>]
   member this.ParScalar() = Compute.parScalarSum this.Fs
 
   [<Benchmark>]
   member this.ParSimd() = Compute.parSimdSum this.Fs
+
+  [<Benchmark>]
+  member this.ParSimdFma() = Compute.parSimdFmaSum this.Fs
 
 // Matrix multiply, same 2x2. ParSimd here is cores x lanes on a real algorithm.
 [<MemoryDiagnoser>]
@@ -404,6 +434,9 @@ module Main =
     let okSeqSimd   = approx (Compute.seqSimdSum cs)
     let okParScalar = approx (Compute.parScalarSum cs)
     let okParSimd   = approx (Compute.parSimdSum cs)
+    // FMA changes rounding (one rounding vs two), so it only matches within tolerance.
+    let okSeqFma    = approx (Compute.seqSimdFmaSum cs)
+    let okParFma    = approx (Compute.parSimdFmaSum cs)
 
     // Matrix multiply: SIMD/parallel reassociate the dot-product sums, so compare
     // every variant to the scalar reference within a float tolerance.
@@ -418,9 +451,9 @@ module Main =
     let okMatMul = mmClose MatMul.seqSimd && mmClose MatMul.parScalar && mmClose MatMul.parSimd
 
     if not (okSumSq && okSumSqF && okMax && okMin && okDot
-            && okSeqSimd && okParScalar && okParSimd && okMatMul) then
-      failwithf "Mismatch: sumSq=%b sumSqF=%b max=%b min=%b dot=%b seqSimd=%b parScalar=%b parSimd=%b matmul=%b"
-        okSumSq okSumSqF okMax okMin okDot okSeqSimd okParScalar okParSimd okMatMul
+            && okSeqSimd && okParScalar && okParSimd && okSeqFma && okParFma && okMatMul) then
+      failwithf "Mismatch: sumSq=%b sumSqF=%b max=%b min=%b dot=%b seqSimd=%b parScalar=%b parSimd=%b seqFma=%b parFma=%b matmul=%b"
+        okSumSq okSumSqF okMax okMin okDot okSeqSimd okParScalar okParSimd okSeqFma okParFma okMatMul
     printfn "Sanity OK — sumSq=%d sumSqF=%g max=%d min=%d dot=%d compute=%g; Vector<int>.Count=%d, Vector<float>.Count=%d, cores=%d"
       refSumSq refSumSqF refMax refMin refDot refCompute Vector<int>.Count Vector<float>.Count Environment.ProcessorCount
 
