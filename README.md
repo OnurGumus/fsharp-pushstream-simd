@@ -44,6 +44,26 @@ A small exploration extending the original push-stream work, ported to **.NET 10
   `float`/`double` (4 lanes); the float pipeline shows the same ≈3.8× win at L1-resident sizes,
   confirming the technique generalizes across element types.
 
+  A **`parReduce`** combinator then partitions the array across cores and runs the *same fused SIMD
+  kernel* per partition (`Parallel.For` + monoid combine). SIMD multiplies throughput per core and
+  cores multiply across partitions, so the two axes compose. On a compute-bound `float` workload
+  (8-core i7-9700K, AVX2):
+
+  | float sum of a compute kernel | N=1,000,000 | N=8,000,000 |
+  |---|---:|---:|
+  | sequential scalar (baseline) | 1.00× | 1.00× |
+  | sequential SIMD (fused stream) | 0.28× | 0.26× |
+  | parallel scalar | 0.17× | 0.15× |
+  | **parallel SIMD (`parReduce`)** | **0.05×** | **0.05×** |
+
+  i.e. ≈3.6–3.9× from lanes × ≈6× from cores ≈ **~20× combined** (slightly sub-multiplicative from
+  shared memory bandwidth + the sequential combine), at a constant ~3.5 KB of task overhead. This is
+  **monoid-only**: `parReduce` requires an associative combine, so it covers reductions
+  (`sum`/`min`/`max`/`count`/`dot`) but deliberately *not* early-exit or order-dependent ops
+  (`scan`/`pairwise`) — the honest boundary of the push model under partitioning. The win only
+  materializes when per-element work is non-trivial; on a bandwidth-bound reduction (e.g. summing raw
+  `int`s) adding cores buys little, so the benchmark uses a compute-heavy kernel.
+
 ---
 
 # F# Advent 2021  Dec 08 - Fast data pipelines with F#6

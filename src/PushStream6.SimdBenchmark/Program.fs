@@ -2,6 +2,7 @@ namespace PushStream6.SimdBenchmark
 
 open System
 open System.Numerics
+open System.Threading.Tasks
 open BenchmarkDotNet.Attributes
 open BenchmarkDotNet.Running
 
@@ -54,6 +55,49 @@ module SimdStream =
     let mutable sacc = szero
     ps (fun v -> vacc <- vcomb vacc v) (fun x -> sacc <- scomb sacc x)
     scomb (horiz vacc) sacc
+
+  // Parallel SIMD reduce: partition the array, run the *same fused vector kernel*
+  // on each partition across cores, then combine the per-partition results.
+  //
+  // Fusion holds INSIDE each partition (vf/sf are InlineIfLambda and this fn is
+  // inline, so the kernel inlines into the Parallel.For body). Only the cross-
+  // partition dispatch goes through a delegate — its cost is amortized over a
+  // whole chunk. This is a MONOID-ONLY operation: (vzero,vcomb)/(szero,scomb)
+  // must be associative so partitions can be combined in any order. Early-exit
+  // and order-dependent ops (scan/pairwise/dot) are deliberately not expressible
+  // here — that is the honest boundary of the push model under partitioning.
+  let inline parReduce
+      (xs : 'T[])
+      (vzero : Vector<'T>) ([<InlineIfLambda>] vf : Vector<'T> -> Vector<'T>)
+                           ([<InlineIfLambda>] vcomb : Vector<'T> -> Vector<'T> -> Vector<'T>)
+      (szero : 'T)         ([<InlineIfLambda>] sf : 'T -> 'T)
+                           ([<InlineIfLambda>] scomb : 'T -> 'T -> 'T)
+      ([<InlineIfLambda>] horiz : Vector<'T> -> 'T) : 'T =
+    let len = xs.Length
+    let n = Vector<'T>.Count
+    // ~64k elements/worker minimum: tiny inputs stay single-threaded (no Task cost).
+    let workers = max 1 (min Environment.ProcessorCount ((len + 65535) / 65536))
+    if workers = 1 then
+      let mutable vacc = vzero
+      let mutable i = 0
+      while i + n <= len do vacc <- vcomb vacc (vf (Vector<'T>(xs, i))); i <- i + n
+      let mutable sacc = szero
+      while i < len do sacc <- scomb sacc (sf xs.[i]); i <- i + 1
+      scomb (horiz vacc) sacc
+    else
+      let chunk = (len + workers - 1) / workers
+      let partials = Array.create workers szero
+      Parallel.For(0, workers, fun p ->
+        let lo = p * chunk
+        let hi = min len (lo + chunk)
+        let mutable vacc = vzero
+        let mutable i = lo
+        while i + n <= hi do vacc <- vcomb vacc (vf (Vector<'T>(xs, i))); i <- i + n
+        let mutable sacc = szero
+        while i < hi do sacc <- scomb sacc (sf xs.[i]); i <- i + 1
+        partials.[p] <- scomb (horiz vacc) sacc)
+      |> ignore
+      Array.fold scomb szero partials
 
   // Fusion-preserving pipe (same trick as the scalar library).
   let inline (|>>) ([<InlineIfLambda>] v : _ -> _) ([<InlineIfLambda>] f : _ -> _) = f v
@@ -109,6 +153,88 @@ module Simd =
 module Scalar =
   open PushStream6.PushStream
   let sumSqI (xs : int[]) = ofArray xs |>> map (fun x -> x * x) |>> fold (+) 0
+
+// A compute-bound, fully-vectorizable per-element kernel. A short fixed-length
+// affine recurrence (STEPS fused multiply-adds) — heavy enough that the work is
+// dominated by arithmetic, not memory bandwidth, which is the regime where
+// adding cores actually pays. Scalar and vector forms do identical math, so
+// every lane/partition produces the same per-element value (only the SUM
+// reorders, hence the float tolerance in the sanity gate).
+module Kernel =
+  [<Literal>]
+  let STEPS = 128
+  let inline scalar (x : float) =
+    let mutable t = x
+    for _ in 1 .. STEPS do t <- t * 0.999 + 0.001
+    t
+  let inline vector (x : Vector<float>) =
+    let a = Vector<float>(0.999)
+    let b = Vector<float>(0.001)
+    let mutable t = x
+    for _ in 1 .. STEPS do t <- t * a + b
+    t
+
+// The 2x2: {sequential, parallel} x {scalar, SIMD}, all summing Kernel over a float[].
+module Compute =
+  open SimdStream
+
+  // sequential + SIMD: the existing fused SIMD push stream, with the heavy kernel as map.
+  let seqSimdSum (xs : float[]) =
+    ofArray xs |>> map Kernel.vector Kernel.scalar |>> sumF
+
+  // parallel + SIMD: same fused kernel, partitioned across cores.
+  let parSimdSum (xs : float[]) =
+    parReduce xs
+      Vector<float>.Zero Kernel.vector (fun a b -> a + b)
+      0.0                Kernel.scalar (+)
+      (fun v -> Vector.Sum v)
+
+  // parallel + scalar: threads but no vectorization (isolates the cores axis).
+  let parScalarSum (xs : float[]) =
+    let len = xs.Length
+    let workers = max 1 (min Environment.ProcessorCount ((len + 65535) / 65536))
+    let chunk = (len + workers - 1) / workers
+    let partials = Array.zeroCreate workers
+    Parallel.For(0, workers, fun p ->
+      let lo = p * chunk
+      let hi = min len (lo + chunk)
+      let mutable s = 0.0
+      for i in lo .. hi - 1 do s <- s + Kernel.scalar xs.[i]
+      partials.[p] <- s)
+    |> ignore
+    Array.sum partials
+
+// Compute-bound 2x2: sequential vs parallel, crossed with scalar vs SIMD.
+// SIMD multiplies throughput per core; cores multiply across partitions; the
+// two compose (ParSimd ~= cores x lanes over the scalar baseline).
+[<MemoryDiagnoser>]
+type ParBench() =
+
+  [<Params(1000000, 8000000)>]
+  member val Length = 0 with get, set
+
+  member val Fs : float[] = [||] with get, set
+
+  [<GlobalSetup>]
+  member this.Setup() =
+    let r = Random 42
+    this.Fs <- Array.init this.Length (fun _ -> r.NextDouble())
+
+  [<Benchmark(Baseline = true)>]
+  member this.SeqScalar() =
+    let xs = this.Fs
+    let mutable s = 0.0
+    for i in 0 .. xs.Length - 1 do s <- s + Kernel.scalar xs.[i]
+    s
+
+  [<Benchmark>]
+  member this.SeqSimd() = Compute.seqSimdSum this.Fs
+
+  [<Benchmark>]
+  member this.ParScalar() = Compute.parScalarSum this.Fs
+
+  [<Benchmark>]
+  member this.ParSimd() = Compute.parSimdSum this.Fs
 
 [<MemoryDiagnoser>]
 type SimdBench() =
@@ -174,7 +300,7 @@ module Main =
   open SimdStream
 
   [<EntryPoint>]
-  let main _ =
+  let main argv =
     // Correctness gate across every sink/type: a fast-but-wrong impl fails here.
     let r = Random 1
     let xs = Array.init 1234 (fun _ -> r.Next(0, 100))
@@ -193,10 +319,21 @@ module Main =
     let okMin    = minI (ofArray xs) = refMin
     let okDot    = dotI xs ys = refDot
 
-    if not (okSumSq && okSumSqF && okMax && okMin && okDot) then
-      failwithf "Mismatch: sumSq=%b sumSqF=%b max=%b min=%b dot=%b" okSumSq okSumSqF okMax okMin okDot
-    printfn "Sanity OK — sumSq=%d sumSqF=%g max=%d min=%d dot=%d; Vector<int>.Count=%d, Vector<float>.Count=%d"
-      refSumSq refSumSqF refMax refMin refDot Vector<int>.Count Vector<float>.Count
+    // Compute-kernel paths: float sum reassociates across lanes/partitions, so
+    // compare within a relative tolerance rather than for bit-equality.
+    let cs = Array.init 100000 (fun i -> float i / 100000.0)
+    let refCompute = (let mutable s = 0.0 in (for x in cs do s <- s + Kernel.scalar x); s)
+    let approx a = abs (a - refCompute) <= 1e-6 * (abs refCompute + 1.0)
+    let okSeqSimd   = approx (Compute.seqSimdSum cs)
+    let okParScalar = approx (Compute.parScalarSum cs)
+    let okParSimd   = approx (Compute.parSimdSum cs)
 
-    BenchmarkRunner.Run<SimdBench>() |> ignore
+    if not (okSumSq && okSumSqF && okMax && okMin && okDot
+            && okSeqSimd && okParScalar && okParSimd) then
+      failwithf "Mismatch: sumSq=%b sumSqF=%b max=%b min=%b dot=%b seqSimd=%b parScalar=%b parSimd=%b"
+        okSumSq okSumSqF okMax okMin okDot okSeqSimd okParScalar okParSimd
+    printfn "Sanity OK — sumSq=%d sumSqF=%g max=%d min=%d dot=%d compute=%g; Vector<int>.Count=%d, Vector<float>.Count=%d, cores=%d"
+      refSumSq refSumSqF refMax refMin refDot refCompute Vector<int>.Count Vector<float>.Count Environment.ProcessorCount
+
+    BenchmarkSwitcher.FromTypes([| typeof<SimdBench>; typeof<ParBench> |]).Run(argv) |> ignore
     0
