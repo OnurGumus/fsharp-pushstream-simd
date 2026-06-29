@@ -64,6 +64,28 @@ A small exploration extending the original push-stream work, ported to **.NET 10
   materializes when per-element work is non-trivial; on a bandwidth-bound reduction (e.g. summing raw
   `int`s) adding cores buys little, so the benchmark uses a compute-heavy kernel.
 
+- **`MatMulBench`** — the same two axes on a *real* algorithm, matrix multiply `C = A·B`
+  (`float`, row-major). The `ikj` loop order makes the inner loop a broadcast-FMA over
+  `Vector<float>` blocks (contiguous B and C rows), and output rows are independent so `Parallel.For`
+  over rows has zero contention. On the 8-core i7-9700K / AVX2:
+
+  | matmul C=A·B | N=512 | N=1024 |
+  |---|---:|---:|
+  | sequential scalar (baseline) | 1.00× | 1.00× |
+  | sequential SIMD | 0.52× | 0.81× |
+  | parallel scalar | 0.21× | 0.21× |
+  | **parallel SIMD** | **0.09×** | **0.12×** |
+
+  i.e. **~8–11× combined**. Note SIMD alone gives only **~1.2–1.9×** here, *not* the ≈4× of the
+  register-bound kernel above — and that contrast is the real lesson. Naive `ikj` matmul does one FMA
+  per inner step against a **read-modify-write of C** (two loads + a store per multiply-add), so the
+  inner loop is throttled by load/store throughput, not arithmetic; widening to 4 lanes can't help
+  what memory ports bottleneck. (The SIMD factor also shrinks from N=512 to N=1024 as the working set
+  spills out of cache.) **SIMD's multiplier scales with arithmetic intensity (FLOPs/byte); the cores
+  multiplier is robust regardless.** Closing matmul's SIMD gap toward 4× needs register
+  blocking/tiling to amortize the loads — exactly what BLAS does, and deliberately left out here to
+  keep the kernel a readable one-liner.
+
 ---
 
 # F# Advent 2021  Dec 08 - Fast data pipelines with F#6

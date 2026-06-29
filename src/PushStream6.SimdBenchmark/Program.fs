@@ -204,6 +204,55 @@ module Compute =
     |> ignore
     Array.sum partials
 
+// ---------------------------------------------------------------------------
+// Matrix multiply C = A*B (row-major float[]) — the canonical compute-bound,
+// embarrassingly-parallel kernel, exercising the SAME two axes as parReduce:
+//   * SIMD : the inner j-loop is a broadcast-FMA over Vector<float> blocks.
+//            ikj loop order keeps B's row and C's row contiguous, so the inner
+//            loop vectorizes cleanly (a column-wise ijk order would not).
+//   * cores: output rows are independent, so Parallel.For over i has zero
+//            contention — each task writes a disjoint slice of C, no combine.
+// ---------------------------------------------------------------------------
+module MatMul =
+
+  // One output row i, vectorized: broadcast A[i,l], stream B's row l, FMA into C's row i.
+  let kernelRow (a:float[]) (b:float[]) (c:float[]) k n i =
+    let w = Vector<float>.Count
+    let cRow = i * n
+    for l in 0 .. k - 1 do
+      let ail  = a.[i * k + l]
+      let va   = Vector<float>(ail)
+      let bRow = l * n
+      let mutable j = 0
+      while j + w <= n do
+        (Vector<float>(c, cRow + j) + va * Vector<float>(b, bRow + j)).CopyTo(c, cRow + j)
+        j <- j + w
+      while j < n do
+        c.[cRow + j] <- c.[cRow + j] + ail * b.[bRow + j]
+        j <- j + 1
+
+  // Same row, scalar (no Vector) — the honest baseline.
+  let scalarRow (a:float[]) (b:float[]) (c:float[]) k n i =
+    let cRow = i * n
+    for l in 0 .. k - 1 do
+      let ail  = a.[i * k + l]
+      let bRow = l * n
+      for j in 0 .. n - 1 do
+        c.[cRow + j] <- c.[cRow + j] + ail * b.[bRow + j]
+
+  let seqScalar a b (c:float[]) m k n =
+    System.Array.Clear(c, 0, c.Length)
+    for i in 0 .. m - 1 do scalarRow a b c k n i
+  let seqSimd a b (c:float[]) m k n =
+    System.Array.Clear(c, 0, c.Length)
+    for i in 0 .. m - 1 do kernelRow a b c k n i
+  let parScalar a b (c:float[]) m k n =
+    System.Array.Clear(c, 0, c.Length)
+    Parallel.For(0, m, fun i -> scalarRow a b c k n i) |> ignore
+  let parSimd a b (c:float[]) m k n =
+    System.Array.Clear(c, 0, c.Length)
+    Parallel.For(0, m, fun i -> kernelRow a b c k n i) |> ignore
+
 // Compute-bound 2x2: sequential vs parallel, crossed with scalar vs SIMD.
 // SIMD multiplies throughput per core; cores multiply across partitions; the
 // two compose (ParSimd ~= cores x lanes over the scalar baseline).
@@ -235,6 +284,34 @@ type ParBench() =
 
   [<Benchmark>]
   member this.ParSimd() = Compute.parSimdSum this.Fs
+
+// Matrix multiply, same 2x2. ParSimd here is cores x lanes on a real algorithm.
+[<MemoryDiagnoser>]
+type MatMulBench() =
+
+  [<Params(512, 1024)>]
+  member val N = 0 with get, set
+
+  member val A : float[] = [||] with get, set
+  member val B : float[] = [||] with get, set
+  member val C : float[] = [||] with get, set
+
+  [<GlobalSetup>]
+  member this.Setup() =
+    let n = this.N
+    let r = Random 42
+    this.A <- Array.init (n * n) (fun _ -> r.NextDouble())
+    this.B <- Array.init (n * n) (fun _ -> r.NextDouble())
+    this.C <- Array.zeroCreate (n * n)
+
+  [<Benchmark(Baseline = true)>]
+  member this.SeqScalar() = MatMul.seqScalar this.A this.B this.C this.N this.N this.N
+  [<Benchmark>]
+  member this.SeqSimd()   = MatMul.seqSimd   this.A this.B this.C this.N this.N this.N
+  [<Benchmark>]
+  member this.ParScalar() = MatMul.parScalar this.A this.B this.C this.N this.N this.N
+  [<Benchmark>]
+  member this.ParSimd()   = MatMul.parSimd   this.A this.B this.C this.N this.N this.N
 
 [<MemoryDiagnoser>]
 type SimdBench() =
@@ -328,12 +405,24 @@ module Main =
     let okParScalar = approx (Compute.parScalarSum cs)
     let okParSimd   = approx (Compute.parSimdSum cs)
 
+    // Matrix multiply: SIMD/parallel reassociate the dot-product sums, so compare
+    // every variant to the scalar reference within a float tolerance.
+    let nn = 64
+    let ma = Array.init (nn * nn) (fun i -> float (i % 7) - 3.0)
+    let mb = Array.init (nn * nn) (fun i -> float (i % 5) - 2.0)
+    let refMM = (let c = Array.zeroCreate (nn * nn) in MatMul.seqScalar ma mb c nn nn nn; c)
+    let mmClose f =
+      let c = Array.zeroCreate (nn * nn)
+      f ma mb c nn nn nn
+      Array.forall2 (fun x y -> abs (x - y) <= 1e-9 * (abs y + 1.0)) c refMM
+    let okMatMul = mmClose MatMul.seqSimd && mmClose MatMul.parScalar && mmClose MatMul.parSimd
+
     if not (okSumSq && okSumSqF && okMax && okMin && okDot
-            && okSeqSimd && okParScalar && okParSimd) then
-      failwithf "Mismatch: sumSq=%b sumSqF=%b max=%b min=%b dot=%b seqSimd=%b parScalar=%b parSimd=%b"
-        okSumSq okSumSqF okMax okMin okDot okSeqSimd okParScalar okParSimd
+            && okSeqSimd && okParScalar && okParSimd && okMatMul) then
+      failwithf "Mismatch: sumSq=%b sumSqF=%b max=%b min=%b dot=%b seqSimd=%b parScalar=%b parSimd=%b matmul=%b"
+        okSumSq okSumSqF okMax okMin okDot okSeqSimd okParScalar okParSimd okMatMul
     printfn "Sanity OK — sumSq=%d sumSqF=%g max=%d min=%d dot=%d compute=%g; Vector<int>.Count=%d, Vector<float>.Count=%d, cores=%d"
       refSumSq refSumSqF refMax refMin refDot refCompute Vector<int>.Count Vector<float>.Count Environment.ProcessorCount
 
-    BenchmarkSwitcher.FromTypes([| typeof<SimdBench>; typeof<ParBench> |]).Run(argv) |> ignore
+    BenchmarkSwitcher.FromTypes([| typeof<SimdBench>; typeof<ParBench>; typeof<MatMulBench> |]).Run(argv) |> ignore
     0
